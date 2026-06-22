@@ -432,7 +432,22 @@ impl Server {
 
     /// run the server.
     pub async fn run<Handler: RequestHandler>(mut self, handler: Handler) -> Result<(), io::Error> {
-        let _handles = Self::spawn_handles(self.listeners, self.new_packet_sender.clone()).await?;
+        // Abort the spawned listener task(s) when `run` is dropped — e.g. when a
+        // caller races it against a shutdown signal. Dropping a `JoinHandle`
+        // merely detaches its task; without this the listener (which owns the
+        // UDP socket) keeps running and the socket stays bound after `run` is
+        // dropped, leaking the port until the process exits.
+        struct AbortOnDrop(Vec<JoinHandle<std::io::Result<()>>>);
+        impl Drop for AbortOnDrop {
+            fn drop(&mut self) {
+                for handle in &self.0 {
+                    handle.abort();
+                }
+            }
+        }
+        let _handles = AbortOnDrop(
+            Self::spawn_handles(self.listeners, self.new_packet_sender.clone()).await?,
+        );
 
         let handler_arc = Arc::new(handler);
         // receive an input, sync our cache / states, then call custom handler
