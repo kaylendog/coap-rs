@@ -62,9 +62,16 @@ router = [
     "dep:serde_json",
     "dep:ciborium",
 ]
+# Q-Block (RFC 9177) support. Pulls in coap-lite's q-block primitives.
+q-block = ["coap-lite/q-block"]
 
 
 [dev-dependencies]
 quickcheck = "1.0"
 socket2 = "0.5"
 tokio-test = "0.4.4"
+
+# Use the colocated coap-lite fork (adds the `q-block` feature: the RangeSet
+# block tracker + missing-blocks codec used by `crate::qblock`).
+[patch.crates-io]
+coap-lite = { path = "../coap-lite" }

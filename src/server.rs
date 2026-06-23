@@ -445,9 +445,8 @@ impl Server {
                 }
             }
         }
-        let _handles = AbortOnDrop(
-            Self::spawn_handles(self.listeners, self.new_packet_sender.clone()).await?,
-        );
+        let _handles =
+            AbortOnDrop(Self::spawn_handles(self.listeners, self.new_packet_sender.clone()).await?);
 
         let handler_arc = Arc::new(handler);
         // receive an input, sync our cache / states, then call custom handler

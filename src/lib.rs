@@ -97,6 +97,8 @@ pub mod client;
 #[cfg(feature = "dtls")]
 pub mod dtls;
 mod observer;
+#[cfg(feature = "q-block")]
+pub mod qblock;
 pub mod request;
 #[cfg(feature = "router")]
 pub mod router;
