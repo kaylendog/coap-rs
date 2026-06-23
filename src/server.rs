@@ -363,10 +363,10 @@ impl ServerCoapState {
         }
     }
 
-    pub fn new() -> Self {
+    pub fn new(block_config: BlockHandlerConfig) -> Self {
         Self {
             observer: Observer::new(),
-            block_handler: BlockHandler::new(BlockHandlerConfig::default()),
+            block_handler: BlockHandler::new(block_config),
             disable_observe: false,
         }
     }
@@ -385,15 +385,34 @@ pub struct Server {
 impl Server {
     /// Creates a CoAP server listening on the given address.
     pub fn new_udp<A: ToSocketAddrs>(addr: A) -> Result<Self, io::Error> {
+        Self::new_udp_with_config(addr, BlockHandlerConfig::default())
+    }
+
+    /// Like [`Server::new_udp`], but with a custom [`BlockHandlerConfig`]. Use a
+    /// smaller `max_total_message_size` to fit a constrained-MTU link; note it
+    /// bounds *both* the accepted inbound request size and the outbound Block2
+    /// (response) fragment size.
+    pub fn new_udp_with_config<A: ToSocketAddrs>(
+        addr: A,
+        block_config: BlockHandlerConfig,
+    ) -> Result<Self, io::Error> {
         let listener: Vec<Box<dyn Listener>> = vec![Box::new(UdpCoapListener::new(addr)?)];
-        Ok(Self::from_listeners(listener))
+        Ok(Self::from_listeners_with_config(listener, block_config))
     }
 
     pub fn from_listeners(listeners: Vec<Box<dyn Listener>>) -> Self {
+        Self::from_listeners_with_config(listeners, BlockHandlerConfig::default())
+    }
+
+    /// Like [`Server::from_listeners`], but with a custom [`BlockHandlerConfig`].
+    pub fn from_listeners_with_config(
+        listeners: Vec<Box<dyn Listener>>,
+        block_config: BlockHandlerConfig,
+    ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         Server {
             listeners,
-            coap_state: Arc::new(Mutex::new(ServerCoapState::new())),
+            coap_state: Arc::new(Mutex::new(ServerCoapState::new(block_config))),
             new_packet_receiver: rx,
             new_packet_sender: tx,
         }
@@ -413,7 +432,22 @@ impl Server {
 
     /// run the server.
     pub async fn run<Handler: RequestHandler>(mut self, handler: Handler) -> Result<(), io::Error> {
-        let _handles = Self::spawn_handles(self.listeners, self.new_packet_sender.clone()).await?;
+        // Abort the spawned listener task(s) when `run` is dropped — e.g. when a
+        // caller races it against a shutdown signal. Dropping a `JoinHandle`
+        // merely detaches its task; without this the listener (which owns the
+        // UDP socket) keeps running and the socket stays bound after `run` is
+        // dropped, leaking the port until the process exits.
+        struct AbortOnDrop(Vec<JoinHandle<std::io::Result<()>>>);
+        impl Drop for AbortOnDrop {
+            fn drop(&mut self) {
+                for handle in &self.0 {
+                    handle.abort();
+                }
+            }
+        }
+        let _handles = AbortOnDrop(
+            Self::spawn_handles(self.listeners, self.new_packet_sender.clone()).await?,
+        );
 
         let handler_arc = Arc::new(handler);
         // receive an input, sync our cache / states, then call custom handler
