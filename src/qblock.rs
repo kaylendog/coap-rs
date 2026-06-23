@@ -1423,4 +1423,104 @@ mod tests {
         send_res.unwrap();
         assert_eq!(recv_res.unwrap(), Some(body));
     }
+
+    #[tokio::test]
+    async fn end_to_end_over_real_udp_loopback_with_loss() {
+        use std::collections::HashSet;
+        use std::net::SocketAddr;
+        use tokio::net::UdpSocket;
+
+        // Real (unpaused) tokio timers — just short so the test is quick.
+        let cfg = QBlockConfig {
+            non_timeout: Duration::from_millis(20),
+            non_receive_timeout: Duration::from_millis(40),
+            ..Default::default()
+        };
+
+        let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = server_sock.local_addr().unwrap();
+        let client_addr = client_sock.local_addr().unwrap();
+
+        let body: Vec<u8> = (0..25u16).flat_map(|i| [i as u8; 16]).collect();
+
+        let (pdu_tx, pdu_rx) = mpsc::channel::<Vec<u8>>(256);
+        let (miss_tx, miss_rx) = mpsc::channel::<Vec<u32>>(16);
+
+        // A real-UDP BlockSink with one-time loss injection on the named blocks.
+        struct UdpSink {
+            sock: Arc<UdpSocket>,
+            peer: SocketAddr,
+            drop_once: Mutex<HashSet<u16>>,
+        }
+        #[async_trait]
+        impl BlockSink for UdpSink {
+            async fn send_block(&self, pdu: Vec<u8>) -> std::io::Result<()> {
+                if let Ok(pkt) = Packet::from_bytes(&pdu) {
+                    if let Some(Ok(bv)) = pkt.get_first_option_as::<BlockValue>(CoapOption::QBlock2)
+                    {
+                        if self.drop_once.lock().unwrap().remove(&bv.num) {
+                            return Ok(()); // lost on the wire, once
+                        }
+                    }
+                }
+                self.sock.send_to(&pdu, self.peer).await.map(|_| ())
+            }
+        }
+
+        let to_client = UdpSink {
+            sock: server_sock.clone(),
+            peer: client_addr,
+            drop_once: Mutex::new([3u16, 17].into_iter().collect()),
+        };
+        let to_server = UdpSink {
+            sock: client_sock.clone(),
+            peer: server_addr,
+            drop_once: Mutex::new(HashSet::new()),
+        };
+
+        // Socket readers bridge inbound datagrams into the driver channels.
+        let cs = client_sock.clone();
+        let reader_c = tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            while let Ok((n, _)) = cs.recv_from(&mut buf).await {
+                if pdu_tx.send(buf[..n].to_vec()).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let ss = server_sock.clone();
+        let reader_s = tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            while let Ok((n, _)) = ss.recv_from(&mut buf).await {
+                if let Ok(pkt) = Packet::from_bytes(&buf[..n]) {
+                    let nums = parse_missing_request(&pkt, CoapOption::QBlock2);
+                    if miss_tx.send(nums).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        let sender = QBlockSender::new(
+            response_template(),
+            CoapOption::QBlock2,
+            body.clone().into(),
+            0,
+            TransferKind::Non,
+            cfg.clone(),
+            0,
+        );
+        let rx = QBlockReceiver::new(CoapOption::QBlock2, request_template(), 1 << 20, cfg);
+
+        let (send_res, recv_res) = tokio::join!(
+            drive_send(sender, &to_client, miss_rx, Duration::from_millis(500)),
+            drive_receive(rx, pdu_rx, &to_server),
+        );
+
+        send_res.unwrap();
+        assert_eq!(recv_res.unwrap(), Some(body));
+        reader_c.abort();
+        reader_s.abort();
+    }
 }
