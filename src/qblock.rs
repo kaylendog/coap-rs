@@ -318,6 +318,12 @@ pub struct QBlockReceiver {
     rec_blocks: RangeSet,
     /// Reassembly buffer, grown as blocks land at their offsets.
     body: Vec<u8>,
+    /// The first accepted block's PDU with its payload and block/size options
+    /// stripped — the "carrier" of the transfer's metadata (code, token, and any
+    /// application options such as content-format or forwarded HTTP status/
+    /// headers). Returned with the assembled body so callers can reconstruct the
+    /// full response, not just its bytes.
+    carrier: Option<Packet>,
     /// Exact body length, known once the final block (More unset) is seen.
     final_len: Option<usize>,
     /// Total body length advertised via the Size1/Size2 option, if present.
@@ -366,6 +372,7 @@ impl QBlockReceiver {
             option,
             rec_blocks: RangeSet::new(),
             body: Vec::new(),
+            carrier: None,
             final_len: None,
             total_len: None,
             szx: None,
@@ -445,6 +452,15 @@ impl QBlockReceiver {
         // Activity resets the recovery backoff (mirrors libcoap blocks_add_entry).
         self.retry = 0;
 
+        // Capture the transfer's metadata carrier from the first block.
+        if self.carrier.is_none() {
+            let mut carrier = pdu.clone();
+            carrier.payload.clear();
+            carrier.clear_option(self.option);
+            carrier.clear_option(self.size_option());
+            self.carrier = Some(carrier);
+        }
+
         if self.body.len() < end {
             self.body.resize(end, 0);
         }
@@ -461,6 +477,13 @@ impl QBlockReceiver {
             return Ok(BlockOutcome::Complete(body));
         }
         Ok(BlockOutcome::Accepted)
+    }
+
+    /// The metadata carrier (first block's PDU, payload/block options stripped),
+    /// available once at least one block has been accepted. Combine with the
+    /// assembled body to reconstruct the full response message.
+    pub fn carrier(&self) -> Option<Packet> {
+        self.carrier.clone()
     }
 
     /// The highest block number the body spans (final block index), derived
@@ -729,7 +752,8 @@ pub async fn drive_send<S: BlockSink + ?Sized>(
 }
 
 /// Drives a Q-Block **receive** with loss recovery, returning the reassembled
-/// body (or `None` if the transfer expired / the input closed first).
+/// body paired with the transfer's metadata carrier ([`QBlockReceiver::carrier`])
+/// — or `None` if the transfer expired / the input closed first.
 ///
 /// Feeds inbound byte PDUs from `pdu_rx` to `receiver`; on the recovery timer it
 /// builds a missing-block request and sends it via `request_sink`. Timing is
@@ -738,7 +762,7 @@ pub async fn drive_receive<S: BlockSink + ?Sized>(
     mut receiver: QBlockReceiver,
     mut pdu_rx: mpsc::Receiver<Vec<u8>>,
     request_sink: &S,
-) -> std::io::Result<Option<Vec<u8>>> {
+) -> std::io::Result<Option<(Vec<u8>, Packet)>> {
     let mut last_activity = Instant::now();
     loop {
         let wait = match receiver.poll_recovery(last_activity.elapsed()) {
@@ -760,7 +784,8 @@ pub async fn drive_receive<S: BlockSink + ?Sized>(
                 let Some(bytes) = pdu else { return Ok(None) };
                 let Ok(pkt) = Packet::from_bytes(&bytes) else { continue };
                 if let BlockOutcome::Complete(body) = receiver.accept(&pkt)? {
-                    return Ok(Some(body));
+                    let carrier = receiver.carrier().unwrap_or(pkt);
+                    return Ok(Some((body, carrier)));
                 }
                 last_activity = Instant::now();
             }
@@ -1349,7 +1374,7 @@ mod tests {
         let req_sink = RecordingSink::default();
         let got = drive_receive(receiver(), rx, &req_sink).await.unwrap();
 
-        assert_eq!(got, Some(body));
+        assert_eq!(got.map(|(body, _carrier)| body), Some(body));
         assert!(
             req_sink.sent.lock().unwrap().is_empty(),
             "no recovery requests expected on a lossless transfer"
@@ -1421,7 +1446,7 @@ mod tests {
         );
 
         send_res.unwrap();
-        assert_eq!(recv_res.unwrap(), Some(body));
+        assert_eq!(recv_res.unwrap().map(|(body, _)| body), Some(body));
     }
 
     #[tokio::test]
@@ -1519,7 +1544,7 @@ mod tests {
         );
 
         send_res.unwrap();
-        assert_eq!(recv_res.unwrap(), Some(body));
+        assert_eq!(recv_res.unwrap().map(|(body, _)| body), Some(body));
         reader_c.abort();
         reader_s.abort();
     }
