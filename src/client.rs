@@ -5,7 +5,7 @@ use coap_lite::{
     block_handler::{extending_splice, BlockValue},
     error::HandlingError,
     CoapOption, CoapRequest, CoapResponse, MessageClass, MessageType, ObserveOption,
-    Packet as Message, RequestType as Method,
+    Packet as Message, RequestType as Method, ResponseType,
 };
 use core::mem;
 
@@ -767,9 +767,14 @@ impl<T: ClientTransport + 'static> CoAPClient<T> {
             .message
             .add_option(CoapOption::Unknown(292), token.clone()); // Request-Tag
 
-        // Receive every packet for this token via the synchronizer, demuxing
-        // Q-Block2 response blocks (-> pdu_rx) from Q-Block1 4.08 missing-block
-        // requests (-> miss_rx, feeding our request-body send).
+        // Receive every packet for this token via the synchronizer, demuxing the
+        // three reply shapes: Q-Block2 response blocks (-> pdu_rx, reassembled
+        // below); Q-Block1 4.08 missing-block requests (-> miss_rx, feeding our
+        // request-body send); and a plain single-PDU response (-> plain_tx). The
+        // server replies in one plain PDU whenever the response body fits one
+        // block (`maybe_serve` returns false): that PDU carries no Q-Block2
+        // option and is not a 4.08, so without this third arm a small response
+        // would be dropped and the call would hang to the receive timeout.
         let (raw_tx, mut raw_rx) = unbounded_channel::<IoResult<Packet>>();
         self.transport
             .synchronizer
@@ -777,7 +782,9 @@ impl<T: ClientTransport + 'static> CoAPClient<T> {
             .await;
         let (pdu_tx, pdu_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
         let (miss_tx, miss_rx) = tokio::sync::mpsc::channel::<Vec<u32>>(16);
+        let (plain_tx, plain_rx) = oneshot::channel::<Message>();
         tokio::spawn(async move {
+            let mut plain_tx = Some(plain_tx);
             while let Some(Ok(pkt)) = raw_rx.recv().await {
                 if pkt.message.get_option(CoapOption::QBlock2).is_some() {
                     if let Ok(bytes) = pkt.message.to_bytes() {
@@ -785,11 +792,20 @@ impl<T: ClientTransport + 'static> CoAPClient<T> {
                             break;
                         }
                     }
-                } else {
+                } else if pkt.message.header.code
+                    == MessageClass::Response(ResponseType::RequestEntityIncomplete)
+                {
                     // A 4.08 asking for missing Q-Block1 request blocks.
                     let _ = miss_tx
                         .send(parse_missing_request(&pkt.message, CoapOption::QBlock1))
                         .await;
+                } else {
+                    // A plain single-PDU response (small body): deliver it as the
+                    // completed response and stop — the full reply is in hand.
+                    if let Some(tx) = plain_tx.take() {
+                        let _ = tx.send(pkt.message);
+                    }
+                    break;
                 }
             }
         });
@@ -838,18 +854,34 @@ impl<T: ClientTransport + 'static> CoAPClient<T> {
             self.max_total_message_size.unwrap_or(usize::MAX),
             self.qblock_config.clone(),
         );
-        let result = drive_receive(receiver, pdu_rx, &sink).await;
+        // Race the Q-Block2 reassembly against a plain single-PDU response: a
+        // large reply completes via `drive_receive`, a small one via `plain_rx`.
+        // `biased` takes a ready plain response before polling the reassembler;
+        // the two are mutually exclusive per transfer, and the loser's future is
+        // dropped.
+        enum Outcome {
+            Plain(Option<Message>),
+            Qblock(IoResult<Option<(Vec<u8>, Message)>>),
+        }
+        let outcome = tokio::select! {
+            biased;
+            plain = plain_rx => Outcome::Plain(plain.ok()),
+            result = drive_receive(receiver, pdu_rx, &sink) => Outcome::Qblock(result),
+        };
         self.transport.synchronizer.remove_sender(&token).await;
 
-        match result? {
-            Some((body, mut carrier)) => {
-                carrier.payload = body;
-                Ok(CoapResponse { message: carrier })
-            }
-            None => Err(Error::new(
-                ErrorKind::TimedOut,
-                "q-block transfer did not complete",
-            )),
+        let timed_out =
+            || Error::new(ErrorKind::TimedOut, "q-block transfer did not complete");
+        match outcome {
+            Outcome::Plain(Some(message)) => Ok(CoapResponse { message }),
+            Outcome::Plain(None) => Err(timed_out()),
+            Outcome::Qblock(result) => match result? {
+                Some((body, mut carrier)) => {
+                    carrier.payload = body;
+                    Ok(CoapResponse { message: carrier })
+                }
+                None => Err(timed_out()),
+            },
         }
     }
 
@@ -2683,6 +2715,47 @@ mod test {
             .unwrap();
 
         assert_eq!(resp.message.payload, qblock_test_body());
+    }
+
+    /// A *small* response that fits one block: the server replies with a single
+    /// plain PDU (`maybe_serve` declines Q-Block2), carrying no Q-Block2 option.
+    #[cfg(feature = "q-block")]
+    async fn qblock_small_handler(
+        mut req: Box<CoapRequest<SocketAddr>>,
+    ) -> Box<CoapRequest<SocketAddr>> {
+        if let Some(resp) = req.response.as_mut() {
+            resp.message.payload = vec![1, 2, 3, 4];
+            resp.message.header.code = coap_lite::MessageClass::Response(Status::Content);
+        }
+        req
+    }
+
+    /// `send_qblock` must round-trip a *small* response — one that fits a single
+    /// block, so the server answers with a plain PDU and never engages Q-Block2.
+    /// Regression for the small-reply hang: the client opts into Q-Block2, and
+    /// without the plain-response completion arm this single PDU is dropped and
+    /// the call times out. Federation is full of such small replies (e.g. an
+    /// empty `{}` body), so this is the common case, not an edge case.
+    #[cfg(feature = "q-block")]
+    #[tokio::test]
+    async fn send_qblock_small_response_round_trips() {
+        let port = spawn_server("127.0.0.1:0", qblock_small_handler)
+            .recv()
+            .await
+            .unwrap();
+
+        let mut client = UdpCoAPClient::new(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        client.set_block1_size(64);
+
+        let request = RequestBuilder::new("/small", Method::Get).build();
+        let resp = time::timeout(Duration::from_secs(5), client.send_qblock(request))
+            .await
+            .expect("small q-block response timed out (plain-response arm regressed)")
+            .unwrap();
+
+        assert_eq!(resp.message.payload, vec![1, 2, 3, 4]);
     }
 
     /// Echoes the request body back as the response — drives a *large request*
