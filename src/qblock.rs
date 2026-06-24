@@ -486,6 +486,16 @@ impl QBlockReceiver {
         self.carrier.clone()
     }
 
+    /// The absolute hold time for a partially-received body
+    /// (`NON_PARTIAL_TIMEOUT`, RFC 9177 §6.2). A transfer that has not completed
+    /// within this — measured from its first block, independent of per-block
+    /// activity — is abandoned, so a peer that dribbles one block per
+    /// `NON_RECEIVE_TIMEOUT` (resetting the recovery backoff each time) cannot
+    /// pin the reassembly buffer indefinitely.
+    pub fn partial_timeout(&self) -> Duration {
+        self.config.non_partial_timeout
+    }
+
     /// The highest block number the body spans (final block index), derived
     /// from the More-unset block if seen, else the advertised Size. `None` if
     /// neither is known (can't safely bound the request).
@@ -764,6 +774,10 @@ pub async fn drive_receive<S: BlockSink + ?Sized>(
     request_sink: &S,
 ) -> std::io::Result<Option<(Vec<u8>, Packet)>> {
     let mut last_activity = Instant::now();
+    // Absolute deadline for the whole transfer: a dribbling peer keeps resetting
+    // the per-block recovery backoff, so the retry cap alone never fires. This
+    // bounds the buffer's lifetime regardless of activity (RFC 9177 §6.2).
+    let partial_deadline = Instant::now() + receiver.partial_timeout();
     loop {
         let wait = match receiver.poll_recovery(last_activity.elapsed()) {
             RecoveryOutcome::Wait(d) => d,
@@ -780,6 +794,7 @@ pub async fn drive_receive<S: BlockSink + ?Sized>(
 
         tokio::select! {
             _ = tokio::time::sleep(wait) => {}
+            _ = tokio::time::sleep_until(partial_deadline) => return Ok(None),
             pdu = pdu_rx.recv() => {
                 let Some(bytes) = pdu else { return Ok(None) };
                 let Ok(pkt) = Packet::from_bytes(&bytes) else { continue };
@@ -1379,6 +1394,35 @@ mod tests {
             req_sink.sent.lock().unwrap().is_empty(),
             "no recovery requests expected on a lossless transfer"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drive_receive_abandons_partial_body_after_partial_timeout() {
+        // A single non-final block of a larger body, with no Size2 option: the
+        // total is never known, so recovery can never build a request and never
+        // Expires — without an absolute partial-timeout the transfer would pin its
+        // buffer forever (a slow-drip DoS). Feed it, keep the channel open, and
+        // assert the transfer is abandoned at `non_partial_timeout`.
+        let cfg = QBlockConfig {
+            non_receive_timeout: Duration::from_secs(4),
+            non_partial_timeout: Duration::from_secs(30),
+            ..Default::default()
+        };
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
+        let blk = block_pkt(0, /* more */ true, 0, vec![0u8; 16]);
+        tx.send(blk.to_bytes().unwrap()).await.unwrap();
+
+        let req_sink = RecordingSink::default();
+        let receiver =
+            QBlockReceiver::new(CoapOption::QBlock2, request_template(), 1 << 20, cfg);
+        // `tx` stays alive across the await, so the channel never closes — the
+        // *only* way out is the partial-timeout (proves it, not a closed channel).
+        let got = drive_receive(receiver, rx, &req_sink).await.unwrap();
+        assert_eq!(
+            got, None,
+            "a stalled partial transfer must be abandoned at non_partial_timeout"
+        );
+        drop(tx);
     }
 
     #[tokio::test(start_paused = true)]

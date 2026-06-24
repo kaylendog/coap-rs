@@ -392,11 +392,24 @@ impl ServerCoapState {
     }
 }
 
-/// Default cap on a reassembled inbound Q-Block1 request body (DoS guard; a
-/// consumer that wants a different bound wraps its own check, as neutrino-lb
-/// does). 16 MiB is generous for any realistic CoAP request.
+/// Default cap on a reassembled inbound Q-Block1 request body (DoS guard;
+/// override with [`Server::set_qblock_max_body_len`], as neutrino-lb does). 16
+/// MiB is generous for any realistic CoAP request.
 #[cfg(feature = "q-block")]
 const DEFAULT_QBLOCK_MAX_BODY: usize = 16 * 1024 * 1024;
+
+/// Default cap on the number of concurrent in-flight Q-Block1 request
+/// reassemblies (DoS guard; override with [`Server::set_qblock_max_transfers`]).
+/// Each in-flight transfer holds a reassembly buffer of up to `max_body_len`, so
+/// `max_transfers * max_body_len` bounds the server's worst-case Q-Block1 memory.
+#[cfg(feature = "q-block")]
+const DEFAULT_QBLOCK_MAX_TRANSFERS: usize = 64;
+
+/// A per-Request-Tag in-flight Q-Block1 reassembly: the source address the
+/// transfer is bound to (so cross-source blocks are dropped) paired with the
+/// channel feeding its [`drive_receive`] task.
+#[cfg(feature = "q-block")]
+type QBlockRecv = (SocketAddr, mpsc::Sender<Vec<u8>>);
 
 /// Server-side Q-Block (RFC 9177) state. Only used under the `q-block` feature;
 /// the existing RFC 7959 `BlockHandler` path is untouched and handles every
@@ -404,13 +417,19 @@ const DEFAULT_QBLOCK_MAX_BODY: usize = 16 * 1024 * 1024;
 /// - `sends`: in-flight Q-Block2 *response* sends, keyed by request token, so a
 ///   client's follow-up missing-block request routes to the right transfer;
 /// - `recvs`: in-flight Q-Block1 *request* reassemblies, keyed by Request-Tag,
-///   each draining into a per-transfer [`drive_receive`] task.
+///   each draining into a per-transfer [`drive_receive`] task. The value pairs
+///   the transfer's bound **source address** (fixed by its first block) with the
+///   block channel, so blocks arriving for that Request-Tag from a *different*
+///   source — spoofable in NON mode — are dropped instead of injected into the
+///   reassembly (RFC 9177 §5 keys transfers on Request-Tag, which is not itself
+///   authenticated).
 #[cfg(feature = "q-block")]
 struct QBlockServerState {
     config: QBlockConfig,
     max_body_len: usize,
+    max_transfers: usize,
     sends: Mutex<HashMap<Vec<u8>, mpsc::Sender<Vec<u32>>>>,
-    recvs: Mutex<HashMap<Vec<u8>, mpsc::Sender<Vec<u8>>>>,
+    recvs: Mutex<HashMap<Vec<u8>, QBlockRecv>>,
 }
 
 /// The Request-Tag (RFC 9175, option 292) carried by `packet`, used to correlate
@@ -426,9 +445,18 @@ fn request_tag_of(packet: &Packet) -> Vec<u8> {
 #[cfg(feature = "q-block")]
 impl QBlockServerState {
     fn new(config: QBlockConfig) -> Self {
+        Self::new_with(
+            config,
+            DEFAULT_QBLOCK_MAX_BODY,
+            DEFAULT_QBLOCK_MAX_TRANSFERS,
+        )
+    }
+
+    fn new_with(config: QBlockConfig, max_body_len: usize, max_transfers: usize) -> Self {
         Self {
             config,
-            max_body_len: DEFAULT_QBLOCK_MAX_BODY,
+            max_body_len,
+            max_transfers,
             sends: Mutex::new(HashMap::new()),
             recvs: Mutex::new(HashMap::new()),
         }
@@ -563,10 +591,38 @@ impl Server {
     }
 
     /// Sets the Q-Block (RFC 9177) configuration for large response transfers.
-    /// Must be called before [`run`](Server::run).
+    /// Must be called before [`run`](Server::run). Preserves any previously-set
+    /// `max_body_len` / `max_transfers` caps.
     #[cfg(feature = "q-block")]
     pub fn set_qblock_config(&mut self, config: QBlockConfig) {
-        self.qblock = Arc::new(QBlockServerState::new(config));
+        self.qblock = Arc::new(QBlockServerState::new_with(
+            config,
+            self.qblock.max_body_len,
+            self.qblock.max_transfers,
+        ));
+    }
+
+    /// Caps the reassembled size of an inbound Q-Block1 request body (DoS guard).
+    /// Defaults to 16 MiB. Must be called before [`run`](Server::run).
+    #[cfg(feature = "q-block")]
+    pub fn set_qblock_max_body_len(&mut self, max_body_len: usize) {
+        self.qblock = Arc::new(QBlockServerState::new_with(
+            self.qblock.config.clone(),
+            max_body_len,
+            self.qblock.max_transfers,
+        ));
+    }
+
+    /// Caps the number of concurrent in-flight Q-Block1 request reassemblies
+    /// (DoS guard against a peer opening many partial transfers). Defaults to 64.
+    /// Must be called before [`run`](Server::run).
+    #[cfg(feature = "q-block")]
+    pub fn set_qblock_max_transfers(&mut self, max_transfers: usize) {
+        self.qblock = Arc::new(QBlockServerState::new_with(
+            self.qblock.config.clone(),
+            self.qblock.max_body_len,
+            max_transfers,
+        ));
     }
 
     async fn spawn_handles(
@@ -720,15 +776,35 @@ impl Server {
         handler: Arc<Handler>,
     ) {
         let rtag = request_tag_of(packet);
-        if let Some(tx) = qblock.recvs.lock().await.get(&rtag).cloned() {
-            let _ = tx.send(bytes).await;
-            return;
-        }
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(256);
-        qblock.recvs.lock().await.insert(rtag.clone(), tx.clone());
+        let src = respond.address();
+        // Decide routing under a single lock so the source-binding check and the
+        // concurrency-cap check can't race a concurrent first block for the same
+        // Request-Tag. No `.await` is held across the guard.
+        let (tx, rx) = {
+            let mut recvs = qblock.recvs.lock().await;
+            if let Some((bound_src, tx)) = recvs.get(&rtag) {
+                if *bound_src != src {
+                    // A block for an in-flight transfer from a different source:
+                    // drop it rather than let a spoofed datagram inject into (or
+                    // stall) another peer's reassembly.
+                    return;
+                }
+                let tx = tx.clone();
+                drop(recvs);
+                let _ = tx.send(bytes).await;
+                return;
+            }
+            if recvs.len() >= qblock.max_transfers {
+                // At the concurrent-transfer cap: drop the opening block. The peer
+                // can retry once an in-flight transfer completes or expires.
+                return;
+            }
+            let (tx, rx) = mpsc::channel::<Vec<u8>>(256);
+            recvs.insert(rtag.clone(), (src, tx.clone()));
+            (tx, rx)
+        };
         let _ = tx.send(bytes).await;
 
-        let src = respond.address();
         let token = packet.get_token().to_vec();
         tokio::spawn(async move {
             // 4.08 recovery requests echo the request token + Request-Tag.
@@ -1451,5 +1527,152 @@ pub mod test {
 
         assert_eq!(got.map(|(body, _)| body), Some(body));
         reader.abort();
+    }
+
+    /// DoS-hardening of the Q-Block1 (inbound request) receive path: source
+    /// binding, the concurrent-transfer cap, and the body-size cap.
+    #[cfg(feature = "q-block")]
+    mod qblock_dos_tests {
+        use super::*;
+        use coap_lite::MessageClass;
+        use std::sync::Mutex;
+
+        /// One serialized Q-Block1 request block PDU (16 B blocks, szx=0).
+        fn q1_block(rtag: &[u8], token: &[u8], num: u16, more: bool, payload: Vec<u8>) -> Vec<u8> {
+            let mut p = Packet::new();
+            p.header.set_type(MessageType::NonConfirmable);
+            p.header.code = MessageClass::Request(RequestType::Put);
+            p.set_token(token.to_vec());
+            p.add_option(CoapOption::Unknown(292), rtag.to_vec()); // Request-Tag
+            p.add_option(CoapOption::UriPath, b"r".to_vec());
+            p.add_option_as::<BlockValue>(
+                CoapOption::QBlock1,
+                BlockValue::new(num as usize, more, 16).unwrap(),
+            );
+            p.payload = payload;
+            p.to_bytes().unwrap()
+        }
+
+        /// A loopback Q-Block server whose handler records every reassembled
+        /// request body it is dispatched. `configure` sets the Q-Block knobs.
+        async fn spawn_recording_server(
+            configure: impl FnOnce(&mut Server),
+        ) -> (SocketAddr, Arc<Mutex<Vec<Vec<u8>>>>) {
+            let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = sock.local_addr().unwrap();
+            let mut server =
+                Server::from_listeners(vec![Box::new(UdpCoapListener::from_socket(sock))]);
+            configure(&mut server);
+            let bodies = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+            let bodies_h = bodies.clone();
+            tokio::spawn(async move {
+                let _ = server
+                    .run(move |req: Box<CoapRequest<SocketAddr>>| {
+                        let bodies = bodies_h.clone();
+                        async move {
+                            bodies.lock().unwrap().push(req.message.payload.clone());
+                            req
+                        }
+                    })
+                    .await;
+            });
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            (addr, bodies)
+        }
+
+        // I3: a Q-Block1 block for an in-flight transfer's Request-Tag, but from a
+        // *different* source, must be dropped — not injected into the reassembly.
+        #[tokio::test]
+        async fn block_from_a_different_source_is_dropped() {
+            let cfg = QBlockConfig {
+                non_receive_timeout: Duration::from_millis(40),
+                ..Default::default()
+            };
+            let (addr, bodies) =
+                spawn_recording_server(move |s| s.set_qblock_config(cfg)).await;
+
+            let good: Vec<u8> = (0..32u8).collect();
+            let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+            // A opens transfer "T" with block 0 → binds it to A's source.
+            a.send_to(&q1_block(b"T", b"\x01", 0, true, good[0..16].to_vec()), addr)
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            // B (different source) forges the final block for the same tag.
+            b.send_to(&q1_block(b"T", b"\x01", 1, false, vec![0xFFu8; 16]), addr)
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            // A completes the transfer correctly.
+            a.send_to(&q1_block(b"T", b"\x01", 1, false, good[16..32].to_vec()), addr)
+                .await
+                .unwrap();
+
+            let mut got = None;
+            for _ in 0..50 {
+                if let Some(body) = bodies.lock().unwrap().first().cloned() {
+                    got = Some(body);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(
+                got.as_deref(),
+                Some(good.as_slice()),
+                "a Q-Block1 block from a different source must not corrupt the transfer"
+            );
+        }
+
+        // I2: a transfer opened past the concurrent-transfer cap is dropped, not
+        // dispatched.
+        #[tokio::test]
+        async fn concurrent_transfer_cap_drops_excess() {
+            let (addr, bodies) = spawn_recording_server(|s| s.set_qblock_max_transfers(1)).await;
+
+            let body: Vec<u8> = (0..32u8).collect();
+            // Transfer A occupies the one slot with an incomplete (more=true) block.
+            let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            a.send_to(&q1_block(b"A", b"\x01", 0, true, body[0..16].to_vec()), addr)
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            // Transfer B is a complete single block — without the cap it would
+            // dispatch immediately; at the cap its opening block is dropped.
+            let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            b.send_to(&q1_block(b"B", b"\x02", 0, false, body[16..32].to_vec()), addr)
+                .await
+                .unwrap();
+
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            assert!(
+                bodies.lock().unwrap().is_empty(),
+                "a transfer opened past the concurrency cap must not be dispatched"
+            );
+        }
+
+        // I2: a Q-Block1 body exceeding `max_body_len` is rejected, not dispatched.
+        #[tokio::test]
+        async fn oversized_body_is_rejected_by_max_body_len() {
+            let (addr, bodies) = spawn_recording_server(|s| s.set_qblock_max_body_len(16)).await;
+
+            let body: Vec<u8> = (0..32u8).collect();
+            let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            a.send_to(&q1_block(b"X", b"\x01", 0, true, body[0..16].to_vec()), addr)
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            // Block 1 starts at offset 16, end 32 > the 16-byte cap → rejected.
+            a.send_to(&q1_block(b"X", b"\x01", 1, false, body[16..32].to_vec()), addr)
+                .await
+                .unwrap();
+
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            assert!(
+                bodies.lock().unwrap().is_empty(),
+                "a Q-Block1 body exceeding max_body_len must not be dispatched"
+            );
+        }
     }
 }

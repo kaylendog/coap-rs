@@ -812,10 +812,23 @@ impl<T: ClientTransport + 'static> CoAPClient<T> {
 
         let sink = ClientTransportSink(self.transport.transport.clone());
 
+        // Aborts the background request-send task when `send_qblock` returns, so
+        // its post-burst `linger` (which can be tens of seconds) cannot outlive
+        // the exchange and pin the socket/buffers. Aborting on return is safe: a
+        // reassembled response means the server already has the full request, so
+        // no further request-block recovery is needed; on timeout/error we are
+        // giving up anyway.
+        struct AbortOnDrop(tokio::task::JoinHandle<()>);
+        impl Drop for AbortOnDrop {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+
         // Send the request: Q-Block1 burst if the body needs more than one block,
         // else a single PDU.
         let body = std::mem::take(&mut request.message.payload);
-        if body.len() > block_size {
+        let _drive_guard = if body.len() > block_size {
             let mut template = request.message.clone();
             template.payload.clear();
             let seed = token
@@ -835,9 +848,9 @@ impl<T: ClientTransport + 'static> CoAPClient<T> {
             // Drive the request send (incl. 4.08 recovery) in the background;
             // we return once the response is reassembled below.
             let send_sink = ClientTransportSink(self.transport.transport.clone());
-            tokio::spawn(async move {
+            Some(AbortOnDrop(tokio::spawn(async move {
                 let _ = drive_send(sender, &send_sink, miss_rx, linger).await;
-            });
+            })))
         } else {
             request.message.payload = body;
             let req_bytes = request
@@ -846,7 +859,8 @@ impl<T: ClientTransport + 'static> CoAPClient<T> {
                 .map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
             self.transport.transport.send(&req_bytes).await?;
             drop(miss_rx);
-        }
+            None
+        };
 
         let receiver = QBlockReceiver::new(
             CoapOption::QBlock2,
