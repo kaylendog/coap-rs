@@ -431,6 +431,18 @@ impl QBlockReceiver {
                 .get_first_option_as::<OptionValueU32>(self.size_option())
                 .and_then(|r| r.ok())
             {
+                // Reject an advertised total beyond the cap *before* it is
+                // recorded: final_block() derives a block count from total_len
+                // that feeds RangeSet::missing(), which would allocate ~total/
+                // block_size entries on the first recovery tick — a one-datagram
+                // OOM. A body that can't fit under max_body_len is rejected at
+                // the same threshold as a realized over-cap block (below).
+                if sz.0 as usize > self.max_body_len {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Q-Block advertised body size exceeds maximum length",
+                    ));
+                }
                 self.total_len = Some(sz.0 as usize);
             }
         }
@@ -1086,6 +1098,27 @@ mod tests {
         let err = rx
             .accept(&block_pkt(10, false, 0, vec![0u8; 16]))
             .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn receiver_rejects_size_option_exceeding_max() {
+        // A peer can advertise a Size2/Size1 total far larger than any block it
+        // actually sends. The opening block fits under the cap, but the
+        // advertised total feeds final_block() -> RangeSet::missing(), which
+        // would allocate a Vec of ~total/block_size entries on the first
+        // recovery tick (a one-datagram OOM). The advertised total must be
+        // rejected at the same threshold as a realized over-cap block.
+        let mut rx = QBlockReceiver::new(
+            CoapOption::QBlock2,
+            request_template(),
+            32,
+            QBlockConfig::default(),
+        );
+        // Block 0 fits (16 B <= 32 B cap), but carries a Size2 of u32::MAX.
+        let mut pkt = block_pkt(0, true, 0, vec![0u8; 16]);
+        pkt.add_option_as::<OptionValueU32>(CoapOption::Size2, OptionValueU32(u32::MAX));
+        let err = rx.accept(&pkt).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
