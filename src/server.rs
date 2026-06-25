@@ -21,6 +21,16 @@ use tokio::{
 
 use crate::observer::{encode_coap_uint, Observer};
 
+#[cfg(feature = "q-block")]
+use crate::qblock::{
+    drive_receive, drive_send, parse_missing_request, QBlockConfig, QBlockReceiver, QBlockSender,
+    ResponderSink, TransferKind,
+};
+#[cfg(feature = "q-block")]
+use coap_lite::{block_handler::BlockValue, MessageType};
+#[cfg(feature = "q-block")]
+use std::collections::HashMap;
+
 #[derive(Debug)]
 pub enum CoAPServerError {
     NetworkError,
@@ -332,6 +342,13 @@ impl ServerCoapState {
     }
 
     pub async fn intercept_response(&mut self, request: &mut CoapRequest<SocketAddr>) {
+        // Q-Block2 responses are handled by the dedicated Q-Block path; keep the
+        // RFC 7959 BlockHandler out of them so the two don't both fragment.
+        #[cfg(feature = "q-block")]
+        if request.message.get_option(CoapOption::QBlock2).is_some() {
+            return;
+        }
+
         let resource_path = request.get_path();
 
         let is_block_fetch_for_observer = request.message.get_option(CoapOption::Block2).is_some()
@@ -375,11 +392,164 @@ impl ServerCoapState {
     }
 }
 
+/// Default cap on a reassembled inbound Q-Block1 request body (DoS guard;
+/// override with [`Server::set_qblock_max_body_len`], as neutrino-lb does). 16
+/// MiB is generous for any realistic CoAP request.
+#[cfg(feature = "q-block")]
+const DEFAULT_QBLOCK_MAX_BODY: usize = 16 * 1024 * 1024;
+
+/// Default cap on the number of concurrent in-flight Q-Block1 request
+/// reassemblies (DoS guard; override with [`Server::set_qblock_max_transfers`]).
+/// Each in-flight transfer holds a reassembly buffer of up to `max_body_len`, so
+/// `max_transfers * max_body_len` bounds the server's worst-case Q-Block1 memory.
+#[cfg(feature = "q-block")]
+const DEFAULT_QBLOCK_MAX_TRANSFERS: usize = 64;
+
+/// A per-Request-Tag in-flight Q-Block1 reassembly: the source address the
+/// transfer is bound to (so cross-source blocks are dropped) paired with the
+/// channel feeding its [`drive_receive`] task.
+#[cfg(feature = "q-block")]
+type QBlockRecv = (SocketAddr, mpsc::Sender<Vec<u8>>);
+
+/// Server-side Q-Block (RFC 9177) state. Only used under the `q-block` feature;
+/// the existing RFC 7959 `BlockHandler` path is untouched and handles every
+/// non-Q-Block request exactly as before. Holds:
+/// - `sends`: in-flight Q-Block2 *response* sends, keyed by request token, so a
+///   client's follow-up missing-block request routes to the right transfer;
+/// - `recvs`: in-flight Q-Block1 *request* reassemblies, keyed by Request-Tag,
+///   each draining into a per-transfer [`drive_receive`] task. The value pairs
+///   the transfer's bound **source address** (fixed by its first block) with the
+///   block channel, so blocks arriving for that Request-Tag from a *different*
+///   source — spoofable in NON mode — are dropped instead of injected into the
+///   reassembly (RFC 9177 §5 keys transfers on Request-Tag, which is not itself
+///   authenticated).
+#[cfg(feature = "q-block")]
+struct QBlockServerState {
+    config: QBlockConfig,
+    max_body_len: usize,
+    max_transfers: usize,
+    sends: Mutex<HashMap<Vec<u8>, mpsc::Sender<Vec<u32>>>>,
+    recvs: Mutex<HashMap<Vec<u8>, QBlockRecv>>,
+}
+
+/// The Request-Tag (RFC 9175, option 292) carried by `packet`, used to correlate
+/// the blocks of one Q-Block1 request. Empty vec if the option is absent.
+#[cfg(feature = "q-block")]
+fn request_tag_of(packet: &Packet) -> Vec<u8> {
+    packet
+        .get_option(CoapOption::Unknown(292))
+        .and_then(|l| l.front().cloned())
+        .unwrap_or_default()
+}
+
+#[cfg(feature = "q-block")]
+impl QBlockServerState {
+    fn new(config: QBlockConfig) -> Self {
+        Self::new_with(
+            config,
+            DEFAULT_QBLOCK_MAX_BODY,
+            DEFAULT_QBLOCK_MAX_TRANSFERS,
+        )
+    }
+
+    fn new_with(config: QBlockConfig, max_body_len: usize, max_transfers: usize) -> Self {
+        Self {
+            config,
+            max_body_len,
+            max_transfers,
+            sends: Mutex::new(HashMap::new()),
+            recvs: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// If `packet` is a missing-block request for an in-flight Q-Block2 send
+    /// (carries a Q-Block2 option and a token we are currently serving), forward
+    /// the requested block numbers to that transfer and return `true`. Otherwise
+    /// `false` — the packet is a fresh request and should be dispatched normally.
+    async fn try_route_missing(&self, packet: &Packet) -> bool {
+        if packet.get_option(CoapOption::QBlock2).is_none() {
+            return false;
+        }
+        let token = packet.get_token().to_vec();
+        let tx = self.sends.lock().await.get(&token).cloned();
+        match tx {
+            Some(tx) => {
+                let _ = tx
+                    .send(parse_missing_request(packet, CoapOption::QBlock2))
+                    .await;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// If the request opted into Q-Block2 and the handler's response is larger
+    /// than one block, stream it as a Q-Block2 burst transfer (spawning a
+    /// [`drive_send`] task over the [`Responder`]) and return `true`. Otherwise
+    /// `false` — the caller should send the response in the normal single PDU.
+    async fn maybe_serve(
+        self: &Arc<Self>,
+        request: &CoapRequest<SocketAddr>,
+        respond: Arc<dyn Responder>,
+    ) -> bool {
+        let Some(req_block) = request
+            .message
+            .get_first_option_as::<BlockValue>(CoapOption::QBlock2)
+            .and_then(|r| r.ok())
+        else {
+            return false;
+        };
+        let Some(response) = request.response.as_ref() else {
+            return false;
+        };
+        let szx = req_block.size_exponent;
+        let body = response.message.payload.clone();
+        if body.len() <= (1usize << (szx + 4)) {
+            return false; // fits one block — no Q-Block needed
+        }
+
+        let token = request.message.get_token().to_vec();
+        let mut template = response.message.clone();
+        template.payload.clear();
+        template.clear_option(CoapOption::QBlock2);
+        template.clear_option(CoapOption::Block2);
+        template.clear_option(CoapOption::Size2);
+        template.header.set_type(MessageType::NonConfirmable);
+        template.set_token(token.clone());
+
+        let seed = token
+            .iter()
+            .fold(0u64, |a, &b| a.wrapping_mul(31).wrapping_add(u64::from(b)));
+        let (tx, rx) = mpsc::channel::<Vec<u32>>(16);
+        self.sends.lock().await.insert(token.clone(), tx);
+
+        let sender = QBlockSender::new(
+            template,
+            CoapOption::QBlock2,
+            body.into(),
+            szx,
+            TransferKind::Non,
+            self.config.clone(),
+            seed,
+        );
+        let linger = self.config.non_receive_timeout * (self.config.non_max_retransmit + 2);
+        let sink = ResponderSink(respond);
+        let state = self.clone();
+        tokio::spawn(async move {
+            let _ = drive_send(sender, &sink, rx, linger).await;
+            state.sends.lock().await.remove(&token);
+        });
+        true
+    }
+}
+
 pub struct Server {
     listeners: Vec<Box<dyn Listener>>,
     coap_state: Arc<Mutex<ServerCoapState>>,
     new_packet_receiver: TransportRequestReceiver,
     new_packet_sender: TransportRequestSender,
+    #[cfg(feature = "q-block")]
+    qblock: Arc<QBlockServerState>,
 }
 
 impl Server {
@@ -415,7 +585,44 @@ impl Server {
             coap_state: Arc::new(Mutex::new(ServerCoapState::new(block_config))),
             new_packet_receiver: rx,
             new_packet_sender: tx,
+            #[cfg(feature = "q-block")]
+            qblock: Arc::new(QBlockServerState::new(QBlockConfig::default())),
         }
+    }
+
+    /// Sets the Q-Block (RFC 9177) configuration for large response transfers.
+    /// Must be called before [`run`](Server::run). Preserves any previously-set
+    /// `max_body_len` / `max_transfers` caps.
+    #[cfg(feature = "q-block")]
+    pub fn set_qblock_config(&mut self, config: QBlockConfig) {
+        self.qblock = Arc::new(QBlockServerState::new_with(
+            config,
+            self.qblock.max_body_len,
+            self.qblock.max_transfers,
+        ));
+    }
+
+    /// Caps the reassembled size of an inbound Q-Block1 request body (DoS guard).
+    /// Defaults to 16 MiB. Must be called before [`run`](Server::run).
+    #[cfg(feature = "q-block")]
+    pub fn set_qblock_max_body_len(&mut self, max_body_len: usize) {
+        self.qblock = Arc::new(QBlockServerState::new_with(
+            self.qblock.config.clone(),
+            max_body_len,
+            self.qblock.max_transfers,
+        ));
+    }
+
+    /// Caps the number of concurrent in-flight Q-Block1 request reassemblies
+    /// (DoS guard against a peer opening many partial transfers). Defaults to 64.
+    /// Must be called before [`run`](Server::run).
+    #[cfg(feature = "q-block")]
+    pub fn set_qblock_max_transfers(&mut self, max_transfers: usize) {
+        self.qblock = Arc::new(QBlockServerState::new_with(
+            self.qblock.config.clone(),
+            self.qblock.max_body_len,
+            max_transfers,
+        ));
     }
 
     async fn spawn_handles(
@@ -445,9 +652,8 @@ impl Server {
                 }
             }
         }
-        let _handles = AbortOnDrop(
-            Self::spawn_handles(self.listeners, self.new_packet_sender.clone()).await?,
-        );
+        let _handles =
+            AbortOnDrop(Self::spawn_handles(self.listeners, self.new_packet_sender.clone()).await?);
 
         let handler_arc = Arc::new(handler);
         // receive an input, sync our cache / states, then call custom handler
@@ -458,6 +664,28 @@ impl Server {
                 .await
                 .ok_or_else(|| std::io::Error::other("listen channel closed"))?;
             if let Ok(packet) = Packet::from_bytes(&bytes) {
+                // Reassemble an inbound Q-Block1 request body before dispatch;
+                // recovery + completion run in a per-transfer task keyed by
+                // Request-Tag. Then route a client's Q-Block2 missing-block
+                // request to its in-flight response send. Everything else falls
+                // through to the unchanged RFC 7959 / single-PDU path.
+                #[cfg(feature = "q-block")]
+                if packet.get_option(CoapOption::QBlock1).is_some() {
+                    Self::route_qblock1_recv(
+                        self.qblock.clone(),
+                        self.coap_state.clone(),
+                        &packet,
+                        bytes,
+                        respond,
+                        handler_arc.clone(),
+                    )
+                    .await;
+                    continue;
+                }
+                #[cfg(feature = "q-block")]
+                if self.qblock.try_route_missing(&packet).await {
+                    continue;
+                }
                 let mut request = Box::new(CoapRequest::<SocketAddr>::from_packet(
                     packet,
                     respond.address(),
@@ -466,20 +694,24 @@ impl Server {
                 let should_forward = coap_state
                     .intercept_request(&mut request, respond.clone())
                     .await;
+                drop(coap_state);
 
                 match should_forward {
                     ShouldForwardToHandler::True => {
                         let handler_clone = handler_arc.clone();
                         let coap_state_clone = self.coap_state.clone();
+                        #[cfg(feature = "q-block")]
+                        let qblock_clone = self.qblock.clone();
                         tokio::spawn(async move {
-                            request = handler_clone.handle_request(request).await;
-                            coap_state_clone
-                                .lock()
-                                .await
-                                .intercept_response(request.as_mut())
-                                .await;
-
-                            Self::respond_to_request(request, respond).await;
+                            Self::dispatch_and_respond(
+                                handler_clone,
+                                coap_state_clone,
+                                #[cfg(feature = "q-block")]
+                                qblock_clone,
+                                request,
+                                respond,
+                            )
+                            .await;
                         });
                     }
                     ShouldForwardToHandler::False => {
@@ -488,6 +720,115 @@ impl Server {
                 }
             }
         }
+    }
+
+    /// Run the handler over `request`, post-process the response (RFC 7959 or
+    /// Q-Block2), and send it. Shared by the normal dispatch path and the
+    /// Q-Block1 reassembly-completion task.
+    #[cfg(not(feature = "q-block"))]
+    async fn dispatch_and_respond<Handler: RequestHandler>(
+        handler: Arc<Handler>,
+        coap_state: Arc<Mutex<ServerCoapState>>,
+        mut request: Box<CoapRequest<SocketAddr>>,
+        respond: Arc<dyn Responder>,
+    ) {
+        request = handler.handle_request(request).await;
+        coap_state
+            .lock()
+            .await
+            .intercept_response(request.as_mut())
+            .await;
+        Self::respond_to_request(request, respond).await;
+    }
+
+    #[cfg(feature = "q-block")]
+    async fn dispatch_and_respond<Handler: RequestHandler>(
+        handler: Arc<Handler>,
+        coap_state: Arc<Mutex<ServerCoapState>>,
+        qblock: Arc<QBlockServerState>,
+        mut request: Box<CoapRequest<SocketAddr>>,
+        respond: Arc<dyn Responder>,
+    ) {
+        request = handler.handle_request(request).await;
+        coap_state
+            .lock()
+            .await
+            .intercept_response(request.as_mut())
+            .await;
+        // Stream a large response via Q-Block2 if the client asked for it.
+        if qblock.maybe_serve(&request, respond.clone()).await {
+            return;
+        }
+        Self::respond_to_request(request, respond).await;
+    }
+
+    /// Routes an inbound Q-Block1 block: appends to the in-flight reassembly for
+    /// its Request-Tag, or starts one (a per-transfer [`drive_receive`] task that
+    /// recovers losses via 4.08 and, on completion, dispatches the reassembled
+    /// request through [`dispatch_and_respond`](Self::dispatch_and_respond)).
+    #[cfg(feature = "q-block")]
+    async fn route_qblock1_recv<Handler: RequestHandler>(
+        qblock: Arc<QBlockServerState>,
+        coap_state: Arc<Mutex<ServerCoapState>>,
+        packet: &Packet,
+        bytes: Vec<u8>,
+        respond: Arc<dyn Responder>,
+        handler: Arc<Handler>,
+    ) {
+        let rtag = request_tag_of(packet);
+        let src = respond.address();
+        // Decide routing under a single lock so the source-binding check and the
+        // concurrency-cap check can't race a concurrent first block for the same
+        // Request-Tag. No `.await` is held across the guard.
+        let (tx, rx) = {
+            let mut recvs = qblock.recvs.lock().await;
+            if let Some((bound_src, tx)) = recvs.get(&rtag) {
+                if *bound_src != src {
+                    // A block for an in-flight transfer from a different source:
+                    // drop it rather than let a spoofed datagram inject into (or
+                    // stall) another peer's reassembly.
+                    return;
+                }
+                let tx = tx.clone();
+                drop(recvs);
+                let _ = tx.send(bytes).await;
+                return;
+            }
+            if recvs.len() >= qblock.max_transfers {
+                // At the concurrent-transfer cap: drop the opening block. The peer
+                // can retry once an in-flight transfer completes or expires.
+                return;
+            }
+            let (tx, rx) = mpsc::channel::<Vec<u8>>(256);
+            recvs.insert(rtag.clone(), (src, tx.clone()));
+            (tx, rx)
+        };
+        let _ = tx.send(bytes).await;
+
+        let token = packet.get_token().to_vec();
+        tokio::spawn(async move {
+            // 4.08 recovery requests echo the request token + Request-Tag.
+            let mut tmpl = Packet::new();
+            tmpl.header.set_type(MessageType::NonConfirmable);
+            tmpl.set_token(token);
+            if !rtag.is_empty() {
+                tmpl.add_option(CoapOption::Unknown(292), rtag.clone());
+            }
+            let receiver = QBlockReceiver::new(
+                CoapOption::QBlock1,
+                tmpl,
+                qblock.max_body_len,
+                qblock.config.clone(),
+            );
+            let sink = ResponderSink(respond.clone());
+            if let Ok(Some((body, mut carrier))) = drive_receive(receiver, rx, &sink).await {
+                carrier.payload = body;
+                let request = Box::new(CoapRequest::from_packet(carrier, src));
+                Self::dispatch_and_respond(handler, coap_state, qblock.clone(), request, respond)
+                    .await;
+            }
+            qblock.recvs.lock().await.remove(&rtag);
+        });
     }
 
     #[cfg(feature = "router")]
@@ -1071,5 +1412,267 @@ pub mod test {
             get_expected_response(),
             "responses do not match"
         );
+    }
+
+    /// End-to-end over real loopback UDP: a request opting into Q-Block2 gets a
+    /// large response streamed by the *built-in server dispatch* as a Q-Block2
+    /// burst; a couple of blocks are dropped on the wire and recovered via the
+    /// server's missing-block routing. Exercises the actual `Server::run` call
+    /// site, not the drivers in isolation.
+    #[cfg(feature = "q-block")]
+    #[tokio::test]
+    async fn qblock2_large_response_over_real_server_with_loss() {
+        use crate::qblock::{drive_receive, BlockSink, QBlockConfig, QBlockReceiver};
+        use coap_lite::block_handler::BlockValue;
+        use coap_lite::{MessageClass, MessageType, ResponseType};
+        use std::collections::HashSet;
+        use tokio::net::UdpSocket;
+
+        let short_cfg = || QBlockConfig {
+            non_timeout: Duration::from_millis(20),
+            non_receive_timeout: Duration::from_millis(40),
+            ..Default::default()
+        };
+        let body: Vec<u8> = (0..25u16).flat_map(|i| [i as u8; 16]).collect();
+
+        // Server on loopback, large body for any request, short Q-Block timers.
+        let server_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_sock.local_addr().unwrap();
+        let mut server =
+            Server::from_listeners(vec![Box::new(UdpCoapListener::from_socket(server_sock))]);
+        server.set_qblock_config(short_cfg());
+        let body_h = body.clone();
+        let _server = tokio::spawn(async move {
+            let _ = server
+                .run(move |mut req: Box<CoapRequest<SocketAddr>>| {
+                    let body = body_h.clone();
+                    async move {
+                        if let Some(resp) = req.response.as_mut() {
+                            resp.message.payload = body;
+                            resp.message.header.code =
+                                MessageClass::Response(ResponseType::Content);
+                        }
+                        req
+                    }
+                })
+                .await;
+        });
+
+        // Client: send a Q-Block2-tagged request, then reassemble via the driver.
+        let client = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let mut req = Packet::new();
+        req.header.set_type(MessageType::NonConfirmable);
+        req.header.code = MessageClass::Request(RequestType::Get);
+        req.set_token(vec![0x42]);
+        req.add_option(CoapOption::UriPath, b"big".to_vec());
+        req.add_option_as::<BlockValue>(
+            CoapOption::QBlock2,
+            BlockValue::new(0, false, 16).unwrap(),
+        );
+        client
+            .send_to(&req.to_bytes().unwrap(), server_addr)
+            .await
+            .unwrap();
+
+        // Reader bridges inbound datagrams into the driver, dropping 3 & 17 once.
+        let (pdu_tx, pdu_rx) = mpsc::channel::<Vec<u8>>(256);
+        let cr = client.clone();
+        let reader = tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            let mut drop_once: HashSet<u16> = [3u16, 17].into_iter().collect();
+            while let Ok((n, _)) = cr.recv_from(&mut buf).await {
+                if let Ok(pkt) = Packet::from_bytes(&buf[..n]) {
+                    if let Some(Ok(bv)) = pkt.get_first_option_as::<BlockValue>(CoapOption::QBlock2)
+                    {
+                        if drop_once.remove(&bv.num) {
+                            continue;
+                        }
+                    }
+                }
+                if pdu_tx.send(buf[..n].to_vec()).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        struct ReqSink {
+            sock: Arc<UdpSocket>,
+            peer: SocketAddr,
+        }
+        #[async_trait]
+        impl BlockSink for ReqSink {
+            async fn send_block(&self, pdu: Vec<u8>) -> std::io::Result<()> {
+                self.sock.send_to(&pdu, self.peer).await.map(|_| ())
+            }
+        }
+        let req_sink = ReqSink {
+            sock: client.clone(),
+            peer: server_addr,
+        };
+
+        // Recovery requests must echo the original token so the server routes them.
+        let mut recovery_template = Packet::new();
+        recovery_template
+            .header
+            .set_type(MessageType::NonConfirmable);
+        recovery_template.header.code = MessageClass::Request(RequestType::Get);
+        recovery_template.set_token(vec![0x42]);
+        let rx = QBlockReceiver::new(CoapOption::QBlock2, recovery_template, 1 << 20, short_cfg());
+
+        let got =
+            tokio::time::timeout(Duration::from_secs(5), drive_receive(rx, pdu_rx, &req_sink))
+                .await
+                .expect("transfer timed out")
+                .unwrap();
+
+        assert_eq!(got.map(|(body, _)| body), Some(body));
+        reader.abort();
+    }
+
+    /// DoS-hardening of the Q-Block1 (inbound request) receive path: source
+    /// binding, the concurrent-transfer cap, and the body-size cap.
+    #[cfg(feature = "q-block")]
+    mod qblock_dos_tests {
+        use super::*;
+        use coap_lite::MessageClass;
+        use std::sync::Mutex;
+
+        /// One serialized Q-Block1 request block PDU (16 B blocks, szx=0).
+        fn q1_block(rtag: &[u8], token: &[u8], num: u16, more: bool, payload: Vec<u8>) -> Vec<u8> {
+            let mut p = Packet::new();
+            p.header.set_type(MessageType::NonConfirmable);
+            p.header.code = MessageClass::Request(RequestType::Put);
+            p.set_token(token.to_vec());
+            p.add_option(CoapOption::Unknown(292), rtag.to_vec()); // Request-Tag
+            p.add_option(CoapOption::UriPath, b"r".to_vec());
+            p.add_option_as::<BlockValue>(
+                CoapOption::QBlock1,
+                BlockValue::new(num as usize, more, 16).unwrap(),
+            );
+            p.payload = payload;
+            p.to_bytes().unwrap()
+        }
+
+        /// A loopback Q-Block server whose handler records every reassembled
+        /// request body it is dispatched. `configure` sets the Q-Block knobs.
+        async fn spawn_recording_server(
+            configure: impl FnOnce(&mut Server),
+        ) -> (SocketAddr, Arc<Mutex<Vec<Vec<u8>>>>) {
+            let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = sock.local_addr().unwrap();
+            let mut server =
+                Server::from_listeners(vec![Box::new(UdpCoapListener::from_socket(sock))]);
+            configure(&mut server);
+            let bodies = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+            let bodies_h = bodies.clone();
+            tokio::spawn(async move {
+                let _ = server
+                    .run(move |req: Box<CoapRequest<SocketAddr>>| {
+                        let bodies = bodies_h.clone();
+                        async move {
+                            bodies.lock().unwrap().push(req.message.payload.clone());
+                            req
+                        }
+                    })
+                    .await;
+            });
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            (addr, bodies)
+        }
+
+        // I3: a Q-Block1 block for an in-flight transfer's Request-Tag, but from a
+        // *different* source, must be dropped — not injected into the reassembly.
+        #[tokio::test]
+        async fn block_from_a_different_source_is_dropped() {
+            let cfg = QBlockConfig {
+                non_receive_timeout: Duration::from_millis(40),
+                ..Default::default()
+            };
+            let (addr, bodies) =
+                spawn_recording_server(move |s| s.set_qblock_config(cfg)).await;
+
+            let good: Vec<u8> = (0..32u8).collect();
+            let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+            // A opens transfer "T" with block 0 → binds it to A's source.
+            a.send_to(&q1_block(b"T", b"\x01", 0, true, good[0..16].to_vec()), addr)
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            // B (different source) forges the final block for the same tag.
+            b.send_to(&q1_block(b"T", b"\x01", 1, false, vec![0xFFu8; 16]), addr)
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            // A completes the transfer correctly.
+            a.send_to(&q1_block(b"T", b"\x01", 1, false, good[16..32].to_vec()), addr)
+                .await
+                .unwrap();
+
+            let mut got = None;
+            for _ in 0..50 {
+                if let Some(body) = bodies.lock().unwrap().first().cloned() {
+                    got = Some(body);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(
+                got.as_deref(),
+                Some(good.as_slice()),
+                "a Q-Block1 block from a different source must not corrupt the transfer"
+            );
+        }
+
+        // I2: a transfer opened past the concurrent-transfer cap is dropped, not
+        // dispatched.
+        #[tokio::test]
+        async fn concurrent_transfer_cap_drops_excess() {
+            let (addr, bodies) = spawn_recording_server(|s| s.set_qblock_max_transfers(1)).await;
+
+            let body: Vec<u8> = (0..32u8).collect();
+            // Transfer A occupies the one slot with an incomplete (more=true) block.
+            let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            a.send_to(&q1_block(b"A", b"\x01", 0, true, body[0..16].to_vec()), addr)
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            // Transfer B is a complete single block — without the cap it would
+            // dispatch immediately; at the cap its opening block is dropped.
+            let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            b.send_to(&q1_block(b"B", b"\x02", 0, false, body[16..32].to_vec()), addr)
+                .await
+                .unwrap();
+
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            assert!(
+                bodies.lock().unwrap().is_empty(),
+                "a transfer opened past the concurrency cap must not be dispatched"
+            );
+        }
+
+        // I2: a Q-Block1 body exceeding `max_body_len` is rejected, not dispatched.
+        #[tokio::test]
+        async fn oversized_body_is_rejected_by_max_body_len() {
+            let (addr, bodies) = spawn_recording_server(|s| s.set_qblock_max_body_len(16)).await;
+
+            let body: Vec<u8> = (0..32u8).collect();
+            let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            a.send_to(&q1_block(b"X", b"\x01", 0, true, body[0..16].to_vec()), addr)
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            // Block 1 starts at offset 16, end 32 > the 16-byte cap → rejected.
+            a.send_to(&q1_block(b"X", b"\x01", 1, false, body[16..32].to_vec()), addr)
+                .await
+                .unwrap();
+
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            assert!(
+                bodies.lock().unwrap().is_empty(),
+                "a Q-Block1 body exceeding max_body_len must not be dispatched"
+            );
+        }
     }
 }
